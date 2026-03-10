@@ -24,6 +24,9 @@ interface CGPreviewProps {
     stampShape?: 'explosion' | 'box';
     autoWrap?: boolean;
     layoutType?: string;
+    imageTransform?: { x: number, y: number, scale: number };
+    imageNaturalWidth?: number;
+    imageNaturalHeight?: number;
   };
   mode: 'title' | 'content';
   isSelected?: boolean;
@@ -121,15 +124,35 @@ export const CGPreview = memo(({
 
   const renderContent = () => {
     if (data.type === 'image') {
+      const transform = data.imageTransform;
       return (
-        <div className="w-full h-full overflow-hidden transition-transform hover:scale-[1.01]" style={{ borderRadius: `${data.borderRadius}px` }}>
+        <div className="w-full h-full overflow-hidden relative" style={{ borderRadius: `${data.borderRadius}px` }}>
           {data.src ? (
-            <img
-              src={data.src}
-              alt="Uploaded Asset"
-              className="w-full h-full object-cover"
-              style={{ opacity: data.bgOpacity }}
-            />
+            <>
+              {/* 底層：模糊且暗化的邊緣延伸圖 */}
+              <img
+                src={data.src}
+                alt=""
+                className="absolute inset-0 w-full h-full object-cover blur-[16px] brightness-75 scale-110 pointer-events-none"
+                style={{ opacity: data.bgOpacity }}
+              />
+
+              {/* 頂層：可受控制與縮放的清晰原圖 */}
+              <img
+                src={data.src}
+                alt="Uploaded Asset"
+                className="absolute pointer-events-none origin-top-left z-10 drop-shadow-2xl max-w-none max-h-none"
+                style={{
+                  opacity: data.bgOpacity,
+                  width: data.imageNaturalWidth ? `${data.imageNaturalWidth}px` : '100%',
+                  height: data.imageNaturalHeight ? `${data.imageNaturalHeight}px` : '100%',
+                  objectFit: 'cover', // 強制維持比例，避免左右壓扁
+                  transform: transform
+                    ? `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`
+                    : 'none'
+                }}
+              />
+            </>
           ) : (
             <div className="w-full h-full bg-white/5 flex items-center justify-center text-[10px] text-white/20 uppercase font-black">
               Missing Image
