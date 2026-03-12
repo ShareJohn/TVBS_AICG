@@ -2421,10 +2421,6 @@ const App: React.FC = () => {
     const formats = [
       { id: "profile", name: "小檔案", icon: "👤" },
       { id: "double", name: "雙框", icon: "◫" },
-      { id: "triple", name: "三框", icon: "𝌆" },
-      { id: "pullout", name: "文章拉字", icon: "📝" },
-      { id: "injury", name: "傷勢圖", icon: "🤕" },
-      { id: "social", name: "社會 NCCG", icon: "🚨" },
     ];
 
     return (
