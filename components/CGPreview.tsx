@@ -27,6 +27,8 @@ interface CGPreviewProps {
     imageTransform?: { x: number, y: number, scale: number };
     imageNaturalWidth?: number;
     imageNaturalHeight?: number;
+    textColor?: string;
+    strokeColor?: string;
   };
   mode: 'title' | 'content';
   isSelected?: boolean;
@@ -72,6 +74,38 @@ const getExplosionPath = (width: number, height: number, spikes = 20) => {
   return points.join(' ');
 };
 
+const BlurredBackground = ({ src, opacity }: { src: string, opacity: number }) => {
+  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+
+  React.useEffect(() => {
+    let active = true;
+    if (!src || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (!active) return;
+      canvas.width = 800; 
+      canvas.height = 600;
+      ctx.filter = 'blur(16px) brightness(75%)';
+      ctx.drawImage(img, -40, -30, 880, 660); 
+    };
+    img.src = src;
+    return () => { active = false; };
+  }, [src]);
+
+  return (
+    <canvas 
+      ref={canvasRef} 
+      className="absolute inset-0 w-full h-full object-cover pointer-events-none scale-110" 
+      style={{ opacity, zIndex: 0 }} 
+    />
+  );
+};
+
 export const CGPreview = memo(({
   data,
   mode,
@@ -91,14 +125,12 @@ export const CGPreview = memo(({
   const strokeWidth = isProfileMainTitleNoBg ? 8 : data.strokeWidth;
 
   // 決定文字顏色與描邊顏色
-  // 如果是標題但沒有開啟背景框（例如 profile 版型的新設定），則字體顏色使用與主題搭配的實色 (theme.solid) 而非白色，避免在淺底圖上無法辨識
-  // 如果是 profile 小標且開啟背景 (強制開啟時)，文字顏色為白色
-  let textColor = (isTitle && showBackground !== false) ? 'white' : theme.solid;
-  let strokeColor = (isTitle && showBackground !== false) ? theme.solid : 'white';
+  let textColor = data.textColor || ((isTitle && showBackground !== false) ? 'white' : theme.solid);
+  let strokeColor = data.strokeColor || ((isTitle && showBackground !== false) ? theme.solid : 'white');
 
   if (isProfileMainTitleNoBg) {
-    textColor = 'white';
-    strokeColor = theme.solid;
+    textColor = data.textColor || 'white';
+    strokeColor = data.strokeColor || theme.solid;
   }
 
   // 核心對齊樣式
@@ -130,12 +162,7 @@ export const CGPreview = memo(({
           {data.src ? (
             <>
               {/* 底層：模糊且暗化的邊緣延伸圖 */}
-              <img
-                src={data.src}
-                alt=""
-                className="absolute inset-0 w-full h-full object-cover blur-[16px] brightness-75 scale-110 pointer-events-none"
-                style={{ opacity: data.bgOpacity }}
-              />
+              <BlurredBackground src={data.src} opacity={data.bgOpacity} />
 
               {/* 頂層：可受控制與縮放的清晰原圖 */}
               <img
@@ -224,7 +251,7 @@ export const CGPreview = memo(({
     else {
       const items = data.items || ['摘要項目'];
       return (
-        <div className="flex flex-col gap-[10px] w-full items-start h-full" style={{ overflow: 'visible' }}>
+        <div className="flex flex-col gap-[10px] w-full items-start" style={{ overflow: 'visible' }}>
           {items.map((item, index) => {
             return (
               <div
@@ -233,7 +260,6 @@ export const CGPreview = memo(({
                 style={{
                   width: showBackground || data.autoWrap ? `${data.width}px` : 'auto',
                   minWidth: data.autoWrap ? 'auto' : 'max-content',
-                  flex: 1
                 }}
               >
                 {showBackground && (
@@ -241,7 +267,7 @@ export const CGPreview = memo(({
                     style={{ opacity: bgAlpha, borderRadius: `${data.borderRadius}px`, zIndex: 0 }}
                   />
                 )}
-                <div className={`relative z-10 flex ${data.autoWrap ? 'items-start' : 'items-center'} h-full w-full`} style={{ paddingLeft: showBackground ? '32px' : '0px', paddingRight: showBackground ? '32px' : '0px' }}>
+                <div className={`relative z-10 flex ${data.autoWrap ? 'items-start' : 'items-center'} w-full py-[10px]`} style={{ paddingLeft: showBackground ? '32px' : '0px', paddingRight: showBackground ? '32px' : '0px' }}>
                   <span style={commonTextStyles} className={`w-full ${textHoverClass}`}>
                     {item}
                   </span>
@@ -255,7 +281,7 @@ export const CGPreview = memo(({
   };
 
   return (
-    <div className={`flex flex-col items-start select-none relative w-full h-full transition-all duration-300 ${isSelected ? 'ring-2 ring-blue-500/20' : ''}`} style={{ overflow: 'visible', transform: `rotate(${data.rotation || 0}deg)` }}>
+    <div className={`flex flex-col items-start select-none relative w-full h-full transition-all duration-300 ${isSelected ? 'ring-2 ring-blue-500/20' : ''}`} style={{ overflow: 'visible' }}>
       {renderContent()}
     </div>
   );

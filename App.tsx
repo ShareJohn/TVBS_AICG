@@ -46,6 +46,14 @@ interface Asset {
   imageTransform?: { x: number; y: number; scale: number };
   imageNaturalWidth?: number;
   imageNaturalHeight?: number;
+  textColor?: string;
+  strokeColor?: string;
+}
+
+interface SetupImage {
+  src: string;
+  width: number;
+  height: number;
 }
 
 interface MarqueeRect {
@@ -97,10 +105,12 @@ const App: React.FC = () => {
   const [isExporting, setIsExporting] = useState(false);
   const [appStage, setAppStage] = useState<"setup" | "editor">("setup");
   const [setupFormat, setSetupFormat] = useState<string>("");
+  const [setupRawText, setSetupRawText] = useState("");
   const [setupMainTitle, setSetupMainTitle] = useState<string>("");
   const [setupTitles, setSetupTitles] = useState<string[]>([""]);
   const [setupContents, setSetupContents] = useState<string[]>([""]);
-  const [setupImages, setSetupImages] = useState<string[]>([]);
+  const [setupImages, setSetupImages] = useState<SetupImage[]>([]);
+  const [setupImageSources, setSetupImageSources] = useState<string[]>([]);
   // const [isAiPanelOpen, setIsAiPanelOpen] = useState(false);
   const [isSaveModalOpen, setIsSaveModalOpen] = useState(false);
   const [saveModalName, setSaveModalName] = useState("");
@@ -125,6 +135,7 @@ const App: React.FC = () => {
 
   const [bgImageUrl, setBgImageUrl] = useState<string | null>(null);
   const [isBgPanelOpen, setIsBgPanelOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   const canvasRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -144,6 +155,73 @@ const App: React.FC = () => {
     //   y: window.innerHeight - 350
     // });
   }, []);
+
+  const recalculateProfileLayoutHeights = (currentAssets: Asset[]): Asset[] => {
+    const profileAssets = currentAssets.filter(a => a.layoutType === "profile");
+    if (profileAssets.length === 0) return currentAssets;
+
+    let newAssets = [...currentAssets];
+    const pairsByUniqueId = new Map<string, { titleId?: string, contentId?: string }[]>();
+
+    profileAssets.forEach(a => {
+      const match = a.id.match(/^(title|content)-r(\d+)-(.+)$/);
+      if (match) {
+        const type = match[1];
+        const idx = parseInt(match[2], 10) - 1;
+        const uId = match[3];
+        if (!pairsByUniqueId.has(uId)) {
+          pairsByUniqueId.set(uId, []);
+        }
+        const pairs = pairsByUniqueId.get(uId)!;
+        while (pairs.length <= idx) pairs.push({});
+        if (type === 'title') pairs[idx].titleId = a.id;
+        else if (type === 'content') pairs[idx].contentId = a.id;
+      }
+    });
+
+    for (const [uId, pairs] of Array.from(pairsByUniqueId.entries())) {
+      if (pairs.length === 0) continue;
+
+      let currentY = pairs.length === 1 ? 250 : 200;
+
+      pairs.forEach(pair => {
+        let contentEstimatedHeight = 150;
+        const titleAssetIndex = newAssets.findIndex(a => a.id === pair.titleId);
+        const contentAssetIndex = newAssets.findIndex(a => a.id === pair.contentId);
+
+        let titleVisible = true;
+
+        if (titleAssetIndex !== -1) {
+          newAssets[titleAssetIndex] = { ...newAssets[titleAssetIndex], y: currentY };
+          titleVisible = newAssets[titleAssetIndex].visible ?? true;
+        }
+
+        const cY = currentY + (titleVisible ? 120 : 0);
+
+        if (contentAssetIndex !== -1) {
+          newAssets[contentAssetIndex] = { ...newAssets[contentAssetIndex], y: cY };
+
+          const contentAsset = newAssets[contentAssetIndex];
+          const size = contentAsset.size || 40;
+          const charsPerLine = Math.max(1, Math.floor((contentAsset.baseW || 800) / size));
+          const items = contentAsset.items || [contentAsset.text || ""];
+          let totalLines = 0;
+          items.forEach(item => {
+            // Basic estimation for full-width chars
+            const lines = Math.ceil((item.length || 1) / charsPerLine);
+            totalLines += Math.max(1, lines);
+          });
+
+          const lineHeight = size * 1.5;
+          contentEstimatedHeight = totalLines * lineHeight + (items.length - 1) * 10;
+        }
+
+        currentY = cY + contentEstimatedHeight + 5;
+      });
+    }
+
+    return newAssets;
+  };
 
   const calculateAssetVisualBounds = (
     asset: Asset,
@@ -180,6 +258,26 @@ const App: React.FC = () => {
       return { baseW: Math.max(1, finalW), baseH: rowH };
     } else {
       const items = asset.items || [];
+      const rowH = Math.max(1, asset.size * HEIGHT_FACTOR);
+      
+      let totalLines = 0;
+      if (asset.autoWrap && asset.width > 0) {
+        const padding = asset.showBackground ? 64 : 0;
+        const availableW = asset.width - padding;
+        const charsPerLine = Math.max(1, Math.floor(availableW / asset.size));
+        
+        items.forEach(item => {
+          // Check for manual newlines first
+          const subItems = item.split('\n');
+          subItems.forEach(si => {
+            const lines = Math.ceil((si.length || 1) / charsPerLine);
+            totalLines += Math.max(1, lines);
+          });
+        });
+      } else {
+        totalLines = items.length;
+      }
+
       const maxTextW =
         items.length > 0
           ? Math.max(
@@ -197,8 +295,9 @@ const App: React.FC = () => {
       const finalW = asset.showBackground
         ? Math.max(asset.width, contentW)
         : contentW;
+      
       const totalH =
-        items.length > 0 ? rowH * items.length + 10 * (items.length - 1) : rowH;
+        totalLines > 0 ? rowH * totalLines + 10 * (items.length - 1) : rowH;
       return { baseW: Math.max(1, finalW), baseH: Math.max(1, totalH) };
     }
   };
@@ -255,19 +354,27 @@ const App: React.FC = () => {
   };
 
   const updateAsset = (id: string, patch: Partial<Asset>) => {
-    setAssets((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, ...patch } : a)),
-    );
+    setAssets((prev) => {
+      let nextAssets = prev.map((a) => (a.id === id ? { ...a, ...patch } : a));
+      if (nextAssets.some(a => a.id === id && a.layoutType === "profile")) {
+        nextAssets = recalculateProfileLayoutHeights(nextAssets);
+      }
+      return nextAssets;
+    });
   };
 
   const updateSelectedAssets = (patch: Partial<Asset>) => {
     if (selectedAssetIds.length === 0) return;
     pushToHistory(assets);
-    setAssets((prev) =>
-      prev.map((a) =>
+    setAssets((prev) => {
+      let nextAssets = prev.map((a) =>
         selectedAssetIds.includes(a.id) ? { ...a, ...patch } : a,
-      ),
-    );
+      );
+      if (nextAssets.some(a => selectedAssetIds.includes(a.id) && a.layoutType === "profile")) {
+        nextAssets = recalculateProfileLayoutHeights(nextAssets);
+      }
+      return nextAssets;
+    });
   };
 
   const alignSelectedAssets = (
@@ -929,7 +1036,7 @@ const App: React.FC = () => {
       titles?: string[];
       contents?: string[];
     },
-    initialImages?: string[]
+    initialImages?: SetupImage[]
   ) => {
     pushToHistory(assets);
     const baseId = Date.now();
@@ -940,7 +1047,7 @@ const App: React.FC = () => {
     const customContents = initialData?.contents || [];
 
     let imgIndex = 0;
-    const getNextImage = () => {
+    const getNextImage = (): SetupImage | undefined => {
       if (initialImages && imgIndex < initialImages.length) {
         return initialImages[imgIndex++];
       }
@@ -1048,15 +1155,27 @@ const App: React.FC = () => {
         showBackground: true,
         showStroke: false,
         strokeWidth: 0,
+        autoWrap: true,
       };
 
       // 4. 圖片區域 (回復原始位置 Y: 100-700)
-      const imgSrc = getNextImage();
+      const imgData = getNextImage();
+      const sourceText = setupImageSources[imgIndex - 1] || "";
+      let transform = undefined;
+      if (imgData) {
+        const natW = imgData.width || 1;
+        const natH = imgData.height || 1;
+        const scale = Math.max(w / natW, 600 / natH);
+        const tx = (w - natW * scale) / 2;
+        const ty = (600 - natH * scale) / 2;
+        transform = { x: tx, y: ty, scale: scale };
+      }
+
       const img: Asset = {
         id: `img-${assetUniqueId}`,
         type: "image",
-        src: imgSrc,
-        originalSrc: imgSrc,
+        src: imgData?.src,
+        originalSrc: imgData?.src,
         x,
         y: 100,
         scaleX: 1,
@@ -1077,8 +1196,43 @@ const App: React.FC = () => {
         showStroke: false,
         strokeWidth: 0,
         groupId: mainGroupId,
-        imageTransform: imgSrc ? { x: 0, y: 0, scale: 1 } : undefined,
+        imageNaturalWidth: imgData?.width,
+        imageNaturalHeight: imgData?.height,
+        imageTransform: transform,
       };
+
+      // 5. 資料來源
+      const sourceAsset: Asset | null = sourceText ? {
+        id: `source-${assetUniqueId}`,
+        type: "content",
+        items: [sourceText],
+        x: x + 10,
+        y: 660,
+        scaleX: 1,
+        scaleY: 1,
+        baseW: w - 20,
+        baseH: 30,
+        opacity: 0.75,
+        bgOpacity: 0,
+        name: `${prefix}資料來源 ${index + 1}`,
+        visible: true,
+        font: "'Noto Sans TC', sans-serif",
+        size: 23,
+        theme: "default",
+        width: w - 20,
+        letterSpacing: 0,
+        borderRadius: 0,
+        showBackground: false,
+        showStroke: true,
+        strokeWidth: 3,
+        groupId: mainGroupId,
+        textColor: "white",
+        strokeColor: "black",
+      } : null;
+
+      if (sourceAsset) {
+        textAssets.push(sourceAsset);
+      }
 
       return { topBar, img, title, content };
     };
@@ -1089,7 +1243,7 @@ const App: React.FC = () => {
       const g2 = createGroup(1, 960, w, "雙框");
       decorationAssets = [g1.topBar, g2.topBar];
       imageAssets = [g1.img, g2.img];
-      textAssets = [g1.title, g1.content, g2.title, g2.content];
+      textAssets.push(g1.title, g1.content, g2.title, g2.content);
     } else if (type === "triple") {
       const w = 640;
       const g1 = createGroup(0, 0, w, "三框");
@@ -1112,14 +1266,14 @@ const App: React.FC = () => {
 
       decorationAssets = [g1.topBar, g2.topBar, g3.topBar];
       imageAssets = [g1.img, g2.img, g3.img];
-      textAssets = [
+      textAssets.push(
         g1.title,
         g1.content,
         g2.title,
         g2.content,
         g3.title,
         g3.content,
-      ];
+      );
     } else if (type === "profile" || type === "pullout") {
       const w = 960; // 1920 / 2
       const prefix = type === "profile" ? "小檔案" : "文章拉字";
@@ -1127,7 +1281,7 @@ const App: React.FC = () => {
       if (type === "profile") {
         // 設定底圖 (依需求自動載入指定底圖)
         setBgImageUrl(
-          "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/%E5%B0%8F%E6%AA%94%E6%A1%88%E5%BA%95%E5%9C%9600.png",
+          "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E5%B0%8F%E6%AA%94%E6%A1%88)00.png",
         );
 
         const uniqueId = `${baseId}-profile`;
@@ -1137,8 +1291,8 @@ const App: React.FC = () => {
           id: `title-main-${uniqueId}`,
           type: "title",
           text: customMainTitle || `${prefix} 大標題`,
-          x: 260,
-          y: 70,
+          x: 140,
+          y: 60,
           scaleX: 1,
           scaleY: 1,
           baseW: 1400,
@@ -1148,7 +1302,7 @@ const App: React.FC = () => {
           name: `${prefix}大標題`,
           visible: true,
           font: "'Noto Sans TC', sans-serif",
-          size: 80,
+          size: 110,
           theme: "default",
           width: 1400,
           letterSpacing: 0,
@@ -1161,12 +1315,24 @@ const App: React.FC = () => {
         };
 
         // 2. 左側置入圖片
-        const imgSrc = getNextImage();
+        const imgData = getNextImage();
+        const sourceText1 = setupImageSources[imgIndex - 1] || "";
+
+        let transform1 = undefined;
+        if (imgData) {
+          const natW = imgData.width || 1;
+          const natH = imgData.height || 1;
+          const scale = Math.max(818 / natW, 597 / natH);
+          const tx = (818 - natW * scale) / 2;
+          const ty = (597 - natH * scale) / 2;
+          transform1 = { x: tx, y: ty, scale: scale };
+        }
+
         const leftImg: Asset = {
           id: `img-l-${uniqueId}`,
           type: "image",
-          src: imgSrc,
-          originalSrc: imgSrc,
+          src: imgData?.src,
+          originalSrc: imgData?.src,
           x: 145,
           y: 211,
           scaleX: 1,
@@ -1188,7 +1354,40 @@ const App: React.FC = () => {
           strokeWidth: 0,
           groupId: mainGroupId,
           layoutType: "profile",
+          imageNaturalWidth: imgData?.width,
+          imageNaturalHeight: imgData?.height,
+          imageTransform: transform1,
         };
+
+        if (sourceText1) {
+          textAssets.push({
+            id: `source-l-${uniqueId}`,
+            type: "content",
+            items: [sourceText1],
+            x: 145 + 10,
+            y: 211 + 597 - 40,
+            scaleX: 1,
+            scaleY: 1,
+            baseW: 800,
+            baseH: 30,
+            opacity: 0.75,
+            bgOpacity: 0,
+            name: `${prefix}資料來源`,
+            visible: true,
+            font: "'Noto Sans TC', sans-serif",
+            size: 23,
+            theme: "default",
+            width: 800,
+            letterSpacing: 0,
+            borderRadius: 0,
+            showBackground: false,
+            showStroke: true,
+            strokeWidth: 3,
+            groupId: mainGroupId,
+            textColor: "white",
+            strokeColor: "black"
+          });
+        }
 
         decorationAssets = [];
         imageAssets = [leftImg];
@@ -1197,14 +1396,24 @@ const App: React.FC = () => {
         // 動態生成右側小標題與內文對
         const numPairs = Math.max(customTitles.length, customContents.length, 1);
         for (let i = 0; i < numPairs; i++) {
-          const yOffset = i * 280; // 每組間隔 280px
+          let rTitleY: number, rContentY: number;
+          if (numPairs === 1) {
+            rTitleY = 250;
+            rContentY = 370;
+          } else {
+            // 固定間距，如果超出極限(800)才壓縮
+            const maxInterval = (800 - 120 - 170) / (numPairs - 1);
+            const interval = Math.min(250, maxInterval);
+            rTitleY = 170 + i * interval;
+            rContentY = rTitleY + 120;
+          }
 
           const rTitle: Asset = {
             id: `title-r${i + 1}-${uniqueId}`,
             type: "title",
             text: customTitles[i] || (i === 0 ? "生平" : i === 1 ? "榮耀" : `項目 ${i + 1}`),
-            x: 978,
-            y: 240 + yOffset,
+            x: 970,
+            y: rTitleY,
             scaleX: 1,
             scaleY: 1,
             baseW: 800,
@@ -1214,7 +1423,7 @@ const App: React.FC = () => {
             name: `${prefix}小標題${i + 1}`,
             visible: true,
             font: "'Noto Sans TC', sans-serif",
-            size: 50,
+            size: 60,
             theme: "default",
             width: 800,
             letterSpacing: 0,
@@ -1236,8 +1445,8 @@ const App: React.FC = () => {
                   ? "2025 年 F1 世界冠軍\n多次分站冠軍、年終積分榜長期名列前段\n打破 McLaren 近年冠軍荒的重要車手"
                   : "請輸入內容描述...")
             ],
-            x: 978,
-            y: 320 + yOffset,
+            x: 970,
+            y: rContentY,
             scaleX: 1,
             scaleY: 1,
             baseW: 800,
@@ -1247,7 +1456,7 @@ const App: React.FC = () => {
             name: `${prefix}內文${i + 1}`,
             visible: true,
             font: "'Noto Sans TC', sans-serif",
-            size: 36,
+            size: 40,
             theme: "default",
             width: 800,
             letterSpacing: 0,
@@ -1257,6 +1466,7 @@ const App: React.FC = () => {
             strokeWidth: 0,
             autoWrap: true,
             layoutType: "profile",
+            textColor: "black",
           };
 
           textAssets.push(rTitle, rContent);
@@ -1289,12 +1499,23 @@ const App: React.FC = () => {
           strokeWidth: 0,
           groupId: mainGroupId,
         };
-        const imgSrc = getNextImage();
+        const imgData2 = getNextImage();
+        const sourceText2 = setupImageSources[imgIndex - 1] || "";
+        let transform2 = undefined;
+        if (imgData2) {
+          const natW = imgData2.width || 1;
+          const natH = imgData2.height || 1;
+          const scale = Math.max(w / natW, 600 / natH);
+          const tx = (w - natW * scale) / 2;
+          const ty = (600 - natH * scale) / 2;
+          transform2 = { x: tx, y: ty, scale: scale };
+        }
+
         const leftImg: Asset = {
           id: `img-l-${leftUniqueId}`,
           type: "image",
-          src: imgSrc,
-          originalSrc: imgSrc,
+          src: imgData2?.src,
+          originalSrc: imgData2?.src,
           x: 0,
           y: 100,
           scaleX: 1,
@@ -1315,8 +1536,40 @@ const App: React.FC = () => {
           showStroke: false,
           strokeWidth: 0,
           groupId: mainGroupId,
-          imageTransform: imgSrc ? { x: 0, y: 0, scale: 1 } : undefined,
+          imageNaturalWidth: imgData2?.width,
+          imageNaturalHeight: imgData2?.height,
+          imageTransform: transform2,
         };
+
+        if (sourceText2) {
+          textAssets.push({
+            id: `source-l-${leftUniqueId}`,
+            type: "content",
+            items: [sourceText2],
+            x: 10,
+            y: 660,
+            scaleX: 1,
+            scaleY: 1,
+            baseW: w - 20,
+            baseH: 30,
+            opacity: 0.75,
+            bgOpacity: 0,
+            name: `${prefix}資料來源`,
+            visible: true,
+            font: "'Noto Sans TC', sans-serif",
+            size: 23,
+            theme: "default",
+            width: w - 20,
+            letterSpacing: 0,
+            borderRadius: 0,
+            showBackground: false,
+            showStroke: true,
+            strokeWidth: 3,
+            groupId: mainGroupId,
+            textColor: "white",
+            strokeColor: "black"
+          });
+        }
 
         // 右側 (文字區 - 移動到畫面約 1/2 高度, 左右內縮 15px)
         const rightUniqueId = `${baseId}-right`;
@@ -1423,7 +1676,10 @@ const App: React.FC = () => {
       }
     }
 
-    const combinedAssets = [...decorationAssets, ...imageAssets, ...textAssets];
+    let combinedAssets = [...decorationAssets, ...imageAssets, ...textAssets];
+    if (type === "profile") {
+      combinedAssets = recalculateProfileLayoutHeights(combinedAssets);
+    }
     setAssets((prev) => [...prev, ...combinedAssets]);
     setSelectedAssetIds(combinedAssets.map((a) => a.id));
     // Ensure we don't crash if combinedAssets is empty
@@ -1569,8 +1825,14 @@ const App: React.FC = () => {
     e.stopPropagation();
   };
 
-  const handleExportPng = async () => {
+  const handleExportPngWithChoice = () => {
     if (!canvasRef.current || isExporting) return;
+    setIsExportModalOpen(true);
+  };
+
+  const handleExportPngOriginal = async () => {
+    if (!canvasRef.current) return;
+    setIsExportModalOpen(false);
     try {
       setIsExporting(true);
       await document.fonts.ready;
@@ -1616,6 +1878,134 @@ const App: React.FC = () => {
       link.click();
     } catch (e) {
       console.error("Export failed:", e);
+    } finally {
+      setIsExporting(false);
+      setRefreshKey((prev) => prev + 1);
+    }
+  };
+
+  const handleExportSequence = async () => {
+    if (!canvasRef.current || isExporting) return;
+    setIsExporting(true);
+    setIsExportModalOpen(false);
+
+    try {
+      await document.fonts.ready;
+      const steps: { name: string; filter: (a: Asset) => boolean; showBg: boolean }[] = [];
+
+      // 1. 底圖
+      if (bgImageUrl) {
+        steps.push({ name: "00_底圖", filter: () => false, showBg: true });
+      }
+
+      // 找出所有提及的索引數字 (1, 2, 3...)
+      const indicesUsed = new Set<string>();
+      assets.forEach(a => {
+        const m = a.name.match(/\d+/);
+        if (m) indicesUsed.add(m[0]);
+      });
+      const sortedIndices = Array.from(indicesUsed).sort((a, b) => parseInt(a) - parseInt(b));
+
+      sortedIndices.forEach(idx => {
+        // 圖片 i
+        steps.push({
+          name: `01_G${idx}_圖片`,
+          filter: (a) => a.type === "image" && a.name.includes(idx),
+          showBg: false
+        });
+        // 標題 i
+        steps.push({
+          name: `02_G${idx}_標題`,
+          filter: (a) => a.type === "title" && a.name.includes(idx),
+          showBg: false
+        });
+        // 摘要 i
+        steps.push({
+          name: `03_G${idx}_摘要`,
+          filter: (a) => a.type === "content" && a.name.includes(idx) && a.name.includes("摘要"),
+          showBg: false
+        });
+      });
+
+      // 如果完全沒有索引，則嘗試按類型輸出
+      if (sortedIndices.length === 0) {
+        const types: ("image" | "title" | "content")[] = ["image", "title", "content"];
+        types.forEach(type => {
+            const assetsOfType = assets.filter(a => a.type === type);
+            if (assetsOfType.length > 0) {
+                steps.push({
+                    name: `99_All_${type}`,
+                    filter: (a) => a.type === type,
+                    showBg: false
+                });
+            }
+        });
+      }
+
+      const timestamp = Date.now();
+
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const canvas = await html2canvas(canvasRef.current!, {
+          backgroundColor: null,
+          scale: 2,
+          width: 1920,
+          height: 1080,
+          useCORS: true,
+          logging: false,
+          onclone: (clonedDoc) => {
+            // 隱藏標準疊加層
+            clonedDoc
+              .querySelectorAll(".safety-overlay, .marquee-box, .transform-handle, .marquee-drag")
+              .forEach((u) => ((u as HTMLElement).style.display = "none"));
+
+            const target = clonedDoc.querySelector('[data-id="canvas-main-container"]') as HTMLElement;
+            if (target) {
+              target.style.transform = "none";
+              target.style.left = "0";
+              target.style.top = "0";
+              target.style.margin = "0";
+              target.style.background = "transparent";
+            }
+
+            // 處理底圖
+            const bgImg = clonedDoc.querySelector('img[alt="Background"]') as HTMLElement;
+            if (bgImg) {
+              bgImg.style.display = step.showBg ? "block" : "none";
+            }
+
+            // 處理所有元件
+            assets.forEach(a => {
+                const el = clonedDoc.querySelector(`[data-asset-id="${a.id}"]`) as HTMLElement;
+                if (el) {
+                    el.style.display = step.filter(a) ? "flex" : "none";
+                }
+            });
+
+            // 文字偏移修正
+            clonedDoc
+              .querySelectorAll('[data-id="canvas-main-container"] span')
+              .forEach((span) => {
+                const el = span as HTMLElement;
+                const style = window.getComputedStyle(el);
+                const fontSize = parseFloat(style.fontSize);
+                if (!isNaN(fontSize)) {
+                  el.style.transform = `translateY(${-0.38 * fontSize}px)`;
+                }
+              });
+          },
+        });
+
+        const link = document.createElement("a");
+        link.download = `${i + 1}_${step.name}_${timestamp}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+
+        // 稍微延遲以避免瀏覽器阻塞多個下載
+        await new Promise(r => setTimeout(r, 600));
+      }
+    } catch (e) {
+      console.error("Sequence export failed:", e);
     } finally {
       setIsExporting(false);
       setRefreshKey((prev) => prev + 1);
@@ -1738,7 +2128,7 @@ const App: React.FC = () => {
       }
       if (isCtrl && !e.shiftKey && key === "s") {
         e.preventDefault();
-        handleExportPng();
+        handleExportPngWithChoice();
       }
       if (isCtrl && key === "d") {
         e.preventDefault();
@@ -1781,6 +2171,7 @@ const App: React.FC = () => {
   const handleContentTextChange = (id: string, text: string) => {
     const asset = assets.find((a) => a.id === id);
     if (!asset) return;
+
     updateAsset(
       id,
       asset.type === "content"
@@ -1889,14 +2280,82 @@ const App: React.FC = () => {
     alert("請在畫面上「按住 Ctrl + 滑鼠左鍵」拖曳出想要放大的範圍。");
   };
   const handleStartEditing = () => {
-    setAppStage("editor");
-    if (setupFormat) {
+    let finalFormat = setupFormat;
+    let finalMainTitle = setupMainTitle;
+    let finalTitles = [...setupTitles];
+    let finalContents = [...setupContents];
+
+    if (!setupFormat && setupRawText.trim()) {
+      const lines = setupRawText.split('\n');
+      let mT = "";
+      let t: string[] = [];
+      let c: string[] = [];
+      let curIdx = -1;
+
+      const cleanString = (str: string) => str.replace(/[(\uff08\[\u3010]\s*(?:左|中|右)\s*[)\uff09\]\u3011]/g, '').trim();
+      const mainTitleRegex = /[(\uff08\[\u3010]\s*(?:大標|主標|標)\s*[)\uff09\]\u3011]/;
+      const subTitleRegex = /[(\uff08\[\u3010]\s*(?:小標|次標)\s*[)\uff09\]\u3011]/;
+
+      lines.forEach(line => {
+        const trimmed = line.trim();
+
+        if (mainTitleRegex.test(trimmed)) {
+          let t = trimmed.replace(mainTitleRegex, '').replace(/^[=＝\s:-]+|[=＝\s:-]+$/g, '').trim();
+          mT = cleanString(t);
+        } else if (subTitleRegex.test(trimmed)) {
+          let subt = trimmed.replace(subTitleRegex, '').replace(/^[=＝\s:-]+|[=＝\s:-]+$/g, '').trim();
+          t.push(cleanString(subt));
+          c.push("");
+          curIdx = t.length - 1;
+        } else if (trimmed) {
+          const cleanLine = cleanString(trimmed);
+          if (!cleanLine && trimmed.match(/^\s*[(\uff08\[\u3010]\s*(?:左|中|右)\s*[)\uff09\]\u3011]\s*$/)) {
+            // 只有方位標記的單行直接忽略，不加入斷行
+            return;
+          }
+          if (curIdx >= 0) {
+            c[curIdx] += (c[curIdx] ? "\n" : "") + cleanLine;
+          } else {
+            if (c.length === 0) c.push("");
+            c[0] += (c[0] ? "\n" : "") + cleanLine;
+          }
+        }
+      });
+
+      finalMainTitle = mT;
+      finalTitles = t.length ? t : [""];
+      finalContents = c.length ? c : [""];
+
+      const hasLeft = /[(\uff08\[\u3010]\s*左\s*[)\uff09\]\u3011]/.test(setupRawText);
+      const hasRight = /[(\uff08\[\u3010]\s*右\s*[)\uff09\]\u3011]/.test(setupRawText);
+      const hasCenter = /[(\uff08\[\u3010]\s*中\s*[)\uff09\]\u3011]/.test(setupRawText);
+
+      if (t.length >= 3 && hasLeft && hasCenter && hasRight) {
+        finalFormat = "triple";
+      } else if (t.length === 2 && hasLeft && hasRight) {
+        finalFormat = "double";
+      } else {
+        finalFormat = "profile";
+      }
+
+      // Sync the parsed state back for history reasons, though we're leaving the page
+      setSetupMainTitle(finalMainTitle);
+      setSetupTitles(finalTitles);
+      setSetupContents(finalContents);
+      setSetupFormat(finalFormat);
+    }
+
+    if (finalFormat) {
+      if (finalFormat === "profile" && !bgImageUrl) {
+        setBgImageUrl("https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E5%B0%8F%E6%AA%94%E6%A1%88)00.png");
+      }
+      setAppStage("editor");
       applyMultifunctionLayout(
-        setupFormat as any,
+        finalFormat as any,
         {
-          mainTitle: setupMainTitle,
-          titles: setupTitles,
-          contents: setupContents,
+          mainTitle: finalMainTitle,
+          titles: finalTitles,
+          contents: finalContents,
         },
         setupImages
       );
@@ -1912,9 +2371,11 @@ const App: React.FC = () => {
       setBgImageUrl(null);
       setSetupFormat("");
       setSetupMainTitle("");
+      setSetupRawText("");
       setSetupTitles([""]);
       setSetupContents([""]);
       setSetupImages([]);
+      setSetupImageSources([]);
       setAppStage("setup");
     }
   };
@@ -1922,18 +2383,37 @@ const App: React.FC = () => {
   const handleSetupImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
     const files = Array.from(e.target.files) as File[];
-    const newBase64s: string[] = [];
+    const newImages: SetupImage[] = [];
     for (let file of files) {
-      if (setupImages.length + newBase64s.length >= 3) break;
+      if (setupImages.length + newImages.length >= 3) break;
       if (!file.type.startsWith("image/")) continue;
       const reader = new FileReader();
       const base64 = await new Promise<string>((resolve) => {
         reader.onload = (ev) => resolve(ev.target?.result as string);
         reader.readAsDataURL(file);
       });
-      newBase64s.push(base64);
+      // 讀取真實寬高
+      const img = new Image();
+      const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+        img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+        img.src = base64;
+      });
+      newImages.push({ src: base64, width: dims.w, height: dims.h });
     }
-    setSetupImages((prev) => [...prev, ...newBase64s].slice(0, 3));
+
+    setSetupImages((prev) => {
+      const updatedImages = [...prev, ...newImages].slice(0, 3);
+      // Ensure sync with sources by padding empty strings
+      setSetupImageSources(curr => {
+        const updatedSources = [...curr];
+        while (updatedSources.length < updatedImages.length) {
+          updatedSources.push("");
+        }
+        return updatedSources.slice(0, 3);
+      });
+      return updatedImages;
+    });
+
     e.target.value = ""; // clear
   };
 
@@ -1965,7 +2445,7 @@ const App: React.FC = () => {
                 {formats.map((f) => (
                   <button
                     key={f.id}
-                    onClick={() => setSetupFormat(f.id)}
+                    onClick={() => setSetupFormat(prev => prev === f.id ? "" : f.id)}
                     className={`flex flex-col items-center justify-center gap-3 p-4 md:p-6 rounded-xl border-2 transition-all ${setupFormat === f.id
                       ? `border-blue-500 bg-blue-600/10 shadow-[0_0_20px_rgba(59,130,246,0.2)] scale-[1.02] md:scale-105`
                       : `border-white/10 bg-white/5 hover:bg-white/10 hover:border-white/30 hover:scale-[1.02] md:hover:scale-105`
@@ -1985,110 +2465,45 @@ const App: React.FC = () => {
                   文字內容輸入
                 </h2>
 
-                <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
-                  {/* 大標題 */}
+                {!setupFormat ? (
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">大標題</label>
-                    <input
-                      type="text"
-                      className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-all"
-                      placeholder="輸入主標題..."
-                      value={setupMainTitle}
-                      onChange={(e) => setSetupMainTitle(e.target.value)}
+                    <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">內文輸入 (可自動解析版型)</label>
+                    <textarea
+                      className="w-full h-64 bg-white/5 border border-white/10 rounded-xl p-4 text-sm outline-none focus:border-blue-500 transition-all resize-none shadow-inner"
+                      placeholder="請在此輸入或貼上整段內容...&#10;使用「(標)=大標題」設定主標&#10;使用「(小標)=小標題」設定小標&#10;其餘內容將自動放進內文&#10;系統將自動判斷並選擇合適的版型。"
+                      value={setupRawText}
+                      onChange={(e) => {
+                        setSetupRawText(e.target.value);
+                      }}
                     />
                   </div>
-
-                  {/* 根據版型生成的動態區塊 */}
-                  {setupFormat === "double" ? (
-                    <div className="grid grid-cols-2 gap-4">
-                      {[0, 1].map((i) => (
-                        <div key={i} className="space-y-3 p-3 bg-white/5 rounded-xl border border-white/5">
-                          <label className="text-[10px] font-black text-blue-400 uppercase tracking-widest">
-                            區塊 {i === 0 ? "左" : "右"}
-                          </label>
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] text-slate-500 font-bold">小標題</label>
-                            <input
-                              type="text"
-                              className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-xs outline-none focus:border-blue-500"
-                              value={setupTitles[i]}
-                              onChange={(e) => {
-                                const newT = [...setupTitles];
-                                newT[i] = e.target.value;
-                                setSetupTitles(newT);
-                              }}
-                            />
-                          </div>
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] text-slate-500 font-bold">小檔案內文</label>
-                            <textarea
-                              className="w-full h-20 bg-black/30 border border-white/10 rounded-lg p-2 text-xs outline-none focus:border-blue-500 resize-none"
-                              value={setupContents[i]}
-                              onChange={(e) => {
-                                const newC = [...setupContents];
-                                newC[i] = e.target.value;
-                                setSetupContents(newC);
-                              }}
-                            />
-                          </div>
-                        </div>
-                      ))}
+                ) : (
+                  <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
+                    {/* 大標題 */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">大標題</label>
+                      <input
+                        type="text"
+                        className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-all"
+                        placeholder="輸入主標題..."
+                        value={setupMainTitle}
+                        onChange={(e) => setSetupMainTitle(e.target.value)}
+                      />
                     </div>
-                  ) : setupFormat === "triple" ? (
-                    <div className="grid grid-cols-3 gap-2">
-                      {[0, 1, 2].map((i) => (
-                        <div key={i} className="space-y-3 p-2 bg-white/5 rounded-xl border border-white/5">
-                          <label className="text-[9px] font-black text-blue-400 uppercase tracking-widest text-center block">
-                            {i === 0 ? "左" : i === 1 ? "中" : "右"}
-                          </label>
-                          <input
-                            type="text"
-                            placeholder="標題"
-                            className="w-full bg-black/30 border border-white/5 rounded p-1.5 text-[10px] outline-none focus:border-blue-500"
-                            value={setupTitles[i]}
-                            onChange={(e) => {
-                              const newT = [...setupTitles];
-                              newT[i] = e.target.value;
-                              setSetupTitles(newT);
-                            }}
-                          />
-                          <textarea
-                            placeholder="內文"
-                            className="w-full h-24 bg-black/30 border border-white/5 rounded p-1.5 text-[10px] outline-none focus:border-blue-500 resize-none"
-                            value={setupContents[i]}
-                            onChange={(e) => {
-                              const newC = [...setupContents];
-                              newC[i] = e.target.value;
-                              setSetupContents(newC);
-                            }}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="space-y-6">
-                      {setupTitles.map((title, i) => {
-                        // For non-double/triple, we only show as many as in the array, 
-                        // but let's limit it for layout sanity or just show what's there.
-                        // However, we only WANT to show the "+" for profile-like layouts.
-                        if (setupFormat !== "profile" && i > 0) return null;
 
-                        return (
-                          <div key={i} className="space-y-4 p-4 bg-white/5 rounded-xl border border-white/5 relative group/item">
-                            {setupFormat === "profile" && setupTitles.length > 1 && (
-                              <button
-                                className="absolute -top-2 -right-2 w-6 h-6 bg-red-600 rounded-full text-white text-[10px] opacity-0 group-hover/item:opacity-100 transition-opacity flex items-center justify-center hover:bg-red-700 shadow-lg z-10"
-                                onClick={() => {
-                                  setSetupTitles(prev => prev.filter((_, idx) => idx !== i));
-                                  setSetupContents(prev => prev.filter((_, idx) => idx !== i));
-                                }}
-                              >✕</button>
-                            )}
+                    {/* 根據版型生成的動態區塊 */}
+                    {setupFormat === "double" ? (
+                      <div className="grid grid-cols-2 gap-4">
+                        {[0, 1].map((i) => (
+                          <div key={i} className="space-y-3 p-3 bg-white/5 rounded-xl border border-white/5">
+                            <label className="text-[10px] font-black text-blue-400 uppercase tracking-widest">
+                              區塊 {i === 0 ? "左" : "右"}
+                            </label>
                             <div className="space-y-1.5">
-                              <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">小標題 {setupFormat === "profile" ? i + 1 : ""}</label>
+                              <label className="text-[10px] text-slate-500 font-bold">小標題</label>
                               <input
                                 type="text"
-                                className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-all"
+                                className="w-full bg-black/30 border border-white/10 rounded-lg p-2 text-xs outline-none focus:border-blue-500"
                                 value={setupTitles[i]}
                                 onChange={(e) => {
                                   const newT = [...setupTitles];
@@ -2098,9 +2513,9 @@ const App: React.FC = () => {
                               />
                             </div>
                             <div className="space-y-1.5">
-                              <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">小檔案內文 {setupFormat === "profile" ? i + 1 : ""}</label>
+                              <label className="text-[10px] text-slate-500 font-bold">小檔案內文</label>
                               <textarea
-                                className="w-full h-32 bg-white/5 border border-white/10 rounded-xl p-4 text-sm outline-none focus:border-blue-500 transition-all resize-none shadow-inner"
+                                className="w-full h-20 bg-black/30 border border-white/10 rounded-lg p-2 text-xs outline-none focus:border-blue-500 resize-none"
                                 value={setupContents[i]}
                                 onChange={(e) => {
                                   const newC = [...setupContents];
@@ -2110,24 +2525,103 @@ const App: React.FC = () => {
                               />
                             </div>
                           </div>
-                        );
-                      })}
+                        ))}
+                      </div>
+                    ) : setupFormat === "triple" ? (
+                      <div className="grid grid-cols-3 gap-2">
+                        {[0, 1, 2].map((i) => (
+                          <div key={i} className="space-y-3 p-2 bg-white/5 rounded-xl border border-white/5">
+                            <label className="text-[9px] font-black text-blue-400 uppercase tracking-widest text-center block">
+                              {i === 0 ? "左" : i === 1 ? "中" : "右"}
+                            </label>
+                            <input
+                              type="text"
+                              placeholder="標題"
+                              className="w-full bg-black/30 border border-white/5 rounded p-1.5 text-[10px] outline-none focus:border-blue-500"
+                              value={setupTitles[i]}
+                              onChange={(e) => {
+                                const newT = [...setupTitles];
+                                newT[i] = e.target.value;
+                                setSetupTitles(newT);
+                              }}
+                            />
+                            <textarea
+                              placeholder="內文"
+                              className="w-full h-24 bg-black/30 border border-white/5 rounded p-1.5 text-[10px] outline-none focus:border-blue-500 resize-none"
+                              value={setupContents[i]}
+                              onChange={(e) => {
+                                const newC = [...setupContents];
+                                newC[i] = e.target.value;
+                                setSetupContents(newC);
+                              }}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="space-y-6">
+                        {setupTitles.map((title, i) => {
+                          // For non-double/triple, we only show as many as in the array, 
+                          // but let's limit it for layout sanity or just show what's there.
+                          // However, we only WANT to show the "+" for profile-like layouts.
+                          if (setupFormat !== "profile" && i > 0) return null;
 
-                      {setupFormat === "profile" && (
-                        <button
-                          onClick={() => {
-                            setSetupTitles(prev => [...prev, ""]);
-                            setSetupContents(prev => [...prev, ""]);
-                          }}
-                          className="w-full py-4 border-2 border-dashed border-white/10 rounded-xl text-white/30 hover:text-blue-400 hover:border-blue-500/30 hover:bg-blue-500/5 transition-all font-bold flex items-center justify-center gap-2"
-                        >
-                          <span className="text-xl">+</span>
-                          增加一組小標題與內文
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
+                          return (
+                            <div key={i} className="space-y-4 p-4 bg-white/5 rounded-xl border border-white/5 relative group/item">
+                              {setupFormat === "profile" && setupTitles.length > 1 && (
+                                <button
+                                  className="absolute -top-2 -right-2 w-6 h-6 bg-red-600 rounded-full text-white text-[10px] opacity-0 group-hover/item:opacity-100 transition-opacity flex items-center justify-center hover:bg-red-700 shadow-lg z-10"
+                                  onClick={() => {
+                                    setSetupTitles(prev => prev.filter((_, idx) => idx !== i));
+                                    setSetupContents(prev => prev.filter((_, idx) => idx !== i));
+                                  }}
+                                >✕</button>
+                              )}
+                              <div className="space-y-1.5">
+                                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">小標題 {setupFormat === "profile" ? i + 1 : ""}</label>
+                                <input
+                                  type="text"
+                                  className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-all"
+                                  value={setupTitles[i]}
+                                  onChange={(e) => {
+                                    const newT = [...setupTitles];
+                                    newT[i] = e.target.value;
+                                    setSetupTitles(newT);
+                                  }}
+                                />
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">小檔案內文 {setupFormat === "profile" ? i + 1 : ""}</label>
+                                <textarea
+                                  className="w-full h-32 bg-white/5 border border-white/10 rounded-xl p-4 text-sm outline-none focus:border-blue-500 transition-all resize-none shadow-inner"
+                                  value={setupContents[i]}
+                                  onChange={(e) => {
+                                    const newC = [...setupContents];
+                                    newC[i] = e.target.value;
+                                    setSetupContents(newC);
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {setupFormat === "profile" && (
+                          <button
+                            onClick={() => {
+                              setSetupTitles(prev => [...prev, ""]);
+                              setSetupContents(prev => [...prev, ""]);
+                            }}
+                            className="w-full py-4 border-2 border-dashed border-white/10 rounded-xl text-white/30 hover:text-blue-400 hover:border-blue-500/30 hover:bg-blue-500/5 transition-all font-bold flex items-center justify-center gap-2"
+                          >
+                            <span className="text-xl">+</span>
+                            增加一組小標題與內文
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="space-y-4">
@@ -2155,22 +2649,37 @@ const App: React.FC = () => {
                     </div>
                   ) : (
                     <div className="flex gap-3 md:gap-4 overflow-x-auto pb-2 custom-scrollbar">
-                      {setupImages.map((src, i) => (
-                        <div key={i} className="relative shrink-0 w-20 h-20 md:w-24 md:h-24 rounded-lg overflow-hidden border border-white/20 shadow-lg group/img bg-black/50">
-                          <img src={src} alt="" className="w-full h-full object-cover" />
-                          <button
-                            className="absolute top-1 right-1 bg-black/70 w-5 h-5 md:w-6 md:h-6 rounded-full text-white text-[9px] md:text-[10px] opacity-100 md:opacity-0 md:group-hover/img:opacity-100 flex items-center justify-center hover:bg-red-500 transition-all border border-white/10 shadow-sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSetupImages(prev => prev.filter((_, idx) => idx !== i));
+                      {setupImages.map((imgData, i) => (
+                        <div key={i} className="flex flex-col gap-2 shrink-0 w-24 md:w-28">
+                          <div className="relative w-full aspect-[4/3] rounded-lg overflow-hidden border border-white/20 shadow-lg group/img bg-black/50">
+                            <img src={imgData.src} alt="" className="w-full h-full object-cover" />
+                            <button
+                              className="absolute top-1 right-1 bg-black/70 w-5 h-5 md:w-6 md:h-6 rounded-full text-white text-[9px] md:text-[10px] opacity-100 md:opacity-0 md:group-hover/img:opacity-100 flex items-center justify-center hover:bg-red-500 transition-all border border-white/10 shadow-sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSetupImages(prev => prev.filter((_, idx) => idx !== i));
+                                setSetupImageSources(prev => prev.filter((_, idx) => idx !== i));
+                              }}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                          <input
+                            type="text"
+                            placeholder="輸入資料來源..."
+                            className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-[10px] md:text-xs outline-none focus:border-blue-500 transition-all text-center placeholder:text-white/30"
+                            value={setupImageSources[i] || ""}
+                            onChange={(e) => {
+                              const newSources = [...setupImageSources];
+                              newSources[i] = e.target.value;
+                              setSetupImageSources(newSources);
                             }}
-                          >
-                            ✕
-                          </button>
+                            onClick={(e) => e.stopPropagation()}
+                          />
                         </div>
                       ))}
                       {setupImages.length < 3 && (
-                        <div className="shrink-0 w-20 h-20 md:w-24 md:h-24 rounded-lg border-2 border-dashed border-white/10 flex flex-col items-center justify-center text-white/20 hover:bg-white/5 transition-all">
+                        <div className="shrink-0 w-24 h-[104px] md:w-28 rounded-lg border-2 border-dashed border-white/10 flex flex-col items-center justify-center text-white/20 hover:bg-white/5 transition-all mb-[34px]">
                           <span className="text-xl md:text-2xl">+</span>
                         </div>
                       )}
@@ -2190,7 +2699,7 @@ const App: React.FC = () => {
             </button>
             <button
               onClick={handleStartEditing}
-              className={`px-8 py-3 rounded-lg font-black tracking-widest transition-all shadow-xl flex items-center justify-center gap-2 w-full sm:w-auto ${setupFormat
+              className={`px-8 py-3 rounded-lg font-black tracking-widest transition-all shadow-xl flex items-center justify-center gap-2 w-full sm:w-auto ${setupFormat || setupRawText.trim()
                 ? "bg-blue-600 text-white hover:bg-blue-500 hover:shadow-[0_0_20px_rgba(37,99,235,0.4)] md:hover:scale-[1.02]"
                 : "bg-white/5 text-white/20 cursor-not-allowed border border-white/5"
                 }`}
@@ -2199,7 +2708,7 @@ const App: React.FC = () => {
             </button>
           </div>
         </div>
-      </div>
+      </div >
     );
   };
 
@@ -2288,7 +2797,7 @@ const App: React.FC = () => {
             <span className="bg-white/5 px-2 py-1 rounded">I: 圖片</span>
           </div>
           <button
-            onClick={handleExportPng}
+            onClick={handleExportPngWithChoice}
             disabled={isExporting}
             className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-1.5 rounded-sm font-black text-[10px] uppercase tracking-widest shadow-2xl active:scale-95 transition-all"
           >
@@ -2296,6 +2805,44 @@ const App: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {isExportModalOpen && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[10000] flex items-center justify-center p-4">
+          <div className="bg-[#1a1a1a] border border-white/10 rounded-2xl p-8 max-w-md w-full shadow-2xl">
+            <h3 className="text-xl font-black text-white mb-6 tracking-tighter uppercase italic border-b border-white/5 pb-4">
+              選擇匯出方式 (Export Options)
+            </h3>
+            <div className="grid grid-cols-1 gap-4">
+              <button
+                onClick={handleExportPngOriginal}
+                className="group flex flex-col items-start p-4 bg-white/5 hover:bg-blue-600/10 border border-white/10 hover:border-blue-500/50 rounded-xl transition-all"
+              >
+                <div className="flex justify-between w-full items-center">
+                    <span className="text-blue-500 font-bold text-sm">一次出 (Single Export)</span>
+                    <span className="text-slate-700 text-[10px]">L: 1920x1080</span>
+                </div>
+                <span className="text-slate-500 text-[10px] mt-1">匯出完整單張 PNG 成品，適合即時使用。</span>
+              </button>
+              <button
+                onClick={handleExportSequence}
+                className="group flex flex-col items-start p-4 bg-white/5 hover:bg-orange-600/10 border border-white/10 hover:border-orange-500/50 rounded-xl transition-all"
+              >
+                <div className="flex justify-between w-full items-center">
+                    <span className="text-orange-500 font-bold text-sm">分動出 (Sequence Export)</span>
+                    <span className="text-slate-700 text-[10px]">Multi PNGs</span>
+                </div>
+                <span className="text-slate-500 text-[10px] mt-1 italic">依序匯出: 底圖 &gt; 圖片 &gt; 標題 &gt; 摘要。適合後製疊加。</span>
+              </button>
+            </div>
+            <button
+              onClick={() => setIsExportModalOpen(false)}
+              className="mt-6 w-full py-2 text-[10px] font-bold text-slate-500 hover:text-white uppercase tracking-widest hover:bg-white/5 rounded-lg transition-colors"
+            >
+              取消 (Cancel)
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="flex flex-1 overflow-hidden relative">
         <aside className="w-[56px] bg-[#1a1a1a] border-r border-black flex flex-col items-center py-4 gap-4 z-[100] overflow-y-auto custom-scrollbar">
@@ -2410,6 +2957,7 @@ const App: React.FC = () => {
                 asset.visible && (
                   <div
                     key={asset.id}
+                    data-asset-id={asset.id}
                     className="absolute flex items-start justify-start group/asset"
                     style={{
                       left: `${asset.x}px`,
@@ -2549,19 +3097,23 @@ const App: React.FC = () => {
                 { name: "關閉背景", url: null, thumb: "✖️" },
                 {
                   name: "曲線",
-                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-(%E6%9B%B2%E7%B7%9A).jpg",
+                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E6%9B%B2%E7%B7%9A).jpg",
                 },
                 {
                   name: "斜方格-凹凸",
-                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-(%E6%96%9C%E6%96%B9%E6%A0%BC-%E5%87%B9%E5%87%B8).jpg",
+                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E6%96%9C%E6%96%B9%E6%A0%BC-%E5%87%B9%E5%87%B8).jpg",
                 },
                 {
                   name: "斜方格",
-                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-(%E6%96%9C%E6%96%B9%E6%A0%BC).jpg",
+                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E6%96%9C%E6%96%B9%E6%A0%BC).jpg",
                 },
                 {
                   name: "凹凸方格",
-                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-(%E5%87%B9%E5%87%B8%E6%96%B9%E6%A0%BC).jpg",
+                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E5%87%B9%E5%87%B8%E6%96%B9%E6%A0%BC).jpg",
+                },
+                {
+                  name: "小檔案預設",
+                  url: "https://raw.githubusercontent.com/ShareJohn/My_TVBS_Image/refs/heads/main/BG-image/BG-(%E5%B0%8F%E6%AA%94%E6%A1%88)00.png",
                 },
               ].map((bg, idx) => (
                 <button
@@ -2696,15 +3248,6 @@ const App: React.FC = () => {
                     </button>
                   </div>
                 )}
-
-                <PropertySlider
-                  label="旋轉角度"
-                  value={firstSelectedAsset.rotation || 0}
-                  min={-180}
-                  max={180}
-                  unit="°"
-                  onChange={(v) => updateSelectedAssets({ rotation: v })}
-                />
 
                 {firstSelectedAsset.type === "stamp" && (
                   <div className="space-y-4 pt-4 border-t border-white/5">
